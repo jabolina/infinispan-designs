@@ -1,7 +1,6 @@
 # Deadlock Detection and Resolution
 
-Currently, Infinispan does not employ a mechanism for deadlock detection.
-However, the code signals that a deadlock detection mechanism was previously in place for the `InfinispanLock` class.
+Currently, Infinispan does not employ a mechanism for deadlock detection and resolution.
 This mechanism is necessary to rectify the cases where the concurrency mechanism can not provide transactions with the resources to proceed.
 In such cases, the deadlock is a permanent state that does not change without external interference to the locking mechanism [1].
 This document proposes an algorithm for deadlock detection and resolution to cover this gap.
@@ -43,32 +42,7 @@ The node can ignore the message if it does not have any external dependency.
 
 ### Chandy-Misra-Haas Algorithm
 
-The initiator node `A` starts the algorithm.
-Translating the pseudo-code [2], we have:
-
-```python
-dependents = dict()
-
-def on_timeout(self): # Runs on the initiator.
-    if self in dependents[self]: # If process is waiting itself.
-        mark_deadlock()
-    else:
-        for process in system_process: # For every process in the system.
-            if is_waiting(process)
-                send(Probe(self, self, process))
-
-def on_probe(self, i, j, k): # Runs upon receiving the probe message. self == k.
-    if is_idle() and i not in dependents[k]:
-        dependent[k].append(i) # Mark that we have already verified this process before.
-        if i == k: # Cycle is closed, deadlock found.
-            mark_deadlock()
-        else:
-            for process in system_process: # Continue disseminating the probes.
-                if is_waiting(k, process):
-                    send(Probe(i, self, process))
-```
-
-The algorithm begins proactively after an event.
+The algorithm begins after an external event.
 Wait for a time $T$ for a resource to become available before starting the algorithm [2].
 That is, executing the algorithm after a timeout is detected.
 After a timeout, the local node sends a `Probe` command to every node holding a resource it is waiting for.
@@ -77,8 +51,14 @@ Upon receiving the `Probe` command, the process handles the message if it is wa
 The system has a deadlock if the initiator `i` is the current node `k`.
 Otherwise, continue probing the processes the current node `k` is waiting for.
 
+The algorithm can identify cycles by "creating" the WFG on demand.
+To be precise, the algorithm is an edge-chasing algorithm for the AND resource model.
+Edge-chasing algorithms utilize probe messages to traverse the edges instead of keeping a global view of the WFG.
+The AND resource model means any process can request one or more resources simultaneously and is only satisfied if all resources are available.
+
 Below is an example of the algorithm executing.
 The node `A` is the initiator process.
+Consider the cycle defined as $`\mathcal{C}=\{A, B, C, D\}`$.
 
 ```mermaid
 graph LR
@@ -92,90 +72,155 @@ graph LR
     D -- P(A, D, A) --> A
 ```
 
-The algorithm works for deadlock detection, where the resolution part is not defined.
+In the above example, if all the processes in $\mathcal{C}$ start the algorithm concurrently, it might lead to aborting multiple transactions to deal with deadlocks or even report phantom deadlocks.
+Additionally, nodes in $\mathcal{C}$ exchange numerous redundant messages, where only a single process breaking the deadlock would be enough to resume a stable state.
+
+In a later work [3], the authors require the transactions to have a uniquely sortable identifier, and nodes only accept probes from initiators with a transaction with a higher identifier.
+This technique reduces the number of messages in the system and guarantees only a single process breaks the deadlock cycle.
+In this work, the authors have more assumptions in the environment (related to message ordering) and focus on a single resource model.
+However, we can employ a similar technique for our implementation.
 
 ## Infinispan Implementation
 
 We discuss how to implement the Chandy-Misra-Hass algorithm into Infinispan.
-Following the suggestion to act after a timeout, we start the algorithm on the `TxDistributionInterceptor#visitLockControlCommand` upon receiving a `org.infinispan.commons.TimeoutException` while acquiring the locks remotely.
-We start a new round of the algorithm, which resets the `dependentes` list.
+We'll split it into multiple sections to address the steps individually.
+We discuss how to trigger the algorithm, how it works, and an example execution.
 
-The algorithm begins by identifying the transaction identifier in the current context.
-This transaction identifier will point to where everything originated.
-The initiator collects the information about the affected keys and identifies the primary owners to start probing.
+### Algorithm
 
-For each primary involved in the transaction, the initiator sends a probe command:
+This section describes how the algorithm works in the context of Infinispan.
+First, we define how we trigger the deadlock detection.
+Following, we explain how the algorithm works, which components are necessary to work, and how nodes interact.
+This explanation is tightly coupled to Infinispan to avoid being abstract in terminology or data structures.
+Finally, we simulate runs of the algorithm.
 
-```json
-{
-    "originator": "initiator-id",
-    "tx": "initiator-tx-id",
-    "keys": ["k1.0", "k2.0", "k3.0", ...]
-}
+#### Triggering
+
+Since the algorithm involves sending more messages (concurrent) during the transaction execution, we make it disabled by default.
+Users should set a property in the `<transaction` element to enable deadlock detection.
+If the algorithm is enabled (`<transaction deadlock-detection="true" />`), we run the algorithm while locking the keys for a transaction.
+
+A system will remain in a deadlock state until an external interference happens.
+This behavior means Infinispan will hang until the configured lock acquisition timeout elapses.
+Therefore, with the algorithm concurrently executing while acquiring keys, we can detect a deadlock earlier than the timeout.
+If a deadlock never happens, the transaction completes without interference from the deadlock detection algorithm.
+
+We do not need to trigger the algorithm always a transaction locks keys.
+After locking a key (or a collection) on the `DefaultLockManager` class, we verify if the acquisition is completed (`LockPromise#isAvailable`).
+We don't need to execute the algorithm when the lock is available.
+Otherwise, when a lock is not readily available, we trigger the deadlock detection algorithm.
+
+In what follows, we describe how the algorithm works in Infinispan.
+
+#### Implementation
+
+We assume the cache is allowed to run the deadlock algorithm (`<transaction deadlock-detection="true" />`).
+We perform the initial check while acquiring the locks for a transaction on the `DefaultLockManager` using the `lock` and `lockAll` methods.
+We verify if the lock is available after acquiring the promise from the `LockContainer`.
+If the lock is available, we can continue without starting the algorithm.
+Otherwise, we utilize an instance of the `DistributedDeadlockDetection` to start the algorithm before returning the lock promise to the caller.
+
+The `DistributedDeadlockDetection` is a new class that implements the Chandy-Misra-Hass algorithm for Infinispan.
+The entry point to trigger the algorithm receives the lock's current (`holder`) and the pending owner (`initiator`).
+From the lock's point of view, the owner is just an arbitrary `Object` to acquire the lock.
+However, the owner must be a `GlobalTransaction` object for deadlock detection.
+
+With the `GlobalTransaction` instance, we can identify which node the transaction belongs to.
+We instantiate a `Probe(initiator, holder)` command to send to the remote node.
+We attach the initiator to track where the command originates and the holder to identify the transaction on the remote node.
+We execute the `Probe` command on a transactional context at the remote node.
+Additionally, the command should be affected by topology changes and be local to a cache.
+
+Upon receiving the `Probe` command, the remote node invokes the `DistributedDeadlockDetection` instance to verify cycles and redirect additional probes.
+We need to verify all keys in the transactional context of the holder.
+We submit an additional `Probe` command to the node holding the key's lock.
+
+The WFG has a cycle if the `initiator` and `holder` objects are equal.
+The cycle means the `Probe` command has traversed from multiple nodes until depending on itself.
+The algorithm can complete the local deadlock check and mark the locks with the `DEADLOCK` state.
+Finally, we roll back the transaction with a `DeadlockDetectedException` error.
+
+The last step is crucial to guarantee liveness.
+During the rollback, we send the `RollbackCommand` command remotely and execute it locally, which causes the locks to be released.
+By design, a transaction acquires first the remote locks and then locally.
+Failing by deadlock on the remote means the lock is not acquired locally.
+However, to guarantee liveness and to eventually identify all cycles in the WFG, every time a key tries to release a lock, existent or not, we trigger the probe mechanism again for the affected keys.
+
+#### Scenarios
+
+The above algorithm should identify deadlock involving multiple nodes in the system.
+However, it would still suffer from many transactions aborting when multiple nodes start the algorithm concurrently.
+We apply the technique from [3] to abort a single transaction per cycle.
+More concretely, we need a way to order the transactions deterministically and only allow probes from an initiator higher than the holder.
+
+We update the `GlobalTransaction` to extend `Comparable<GlobalTransaction>` for ordering.
+The class already has a long scalar identifier and the node's address.
+We use the node's address for ordering and the scalar to break ties.
+We utilize the ordering on the `DistributedDeadlockDetection` implementation and only proceed with execution if the initiator is higher than the current lock's holder.
+
+The decision to continue when the initiator is higher than the holder is arbitrary.
+This approach allows "older" transactions to proceed while aborting more recent ones.
+We could invert the check to abort older transactions and prioritize more recent ones.
+
+Below, we have a pseudo-code overly simplifying the algorithm:
+
+
+```code
+procedure lock(keys, initiator):
+    let locks = DefaultLockManager#lockAll(keys)
+    for lock ∈ locks do
+        if !available(lock) then
+            inspect_transaction(owner(lock), initiator)
+
+
+procedure inspect_transaction(holder, initiator):
+    if initiator > holder then
+        send(Probe(initiator, holder))
+
+when receive(Probe(initiator, holder)):
+    if initiator = holder then
+        rollback(holder)
+        return
+
+    let locked = {lock_owner(k): k ∈ keys(holder)} \ {holder}
+    for h ∈ locked do
+        inspect_transaction(h, initiator)
+
+when rollback(rolling_back):
+    for k ∈ keys(rolling_back) do
+        let owner = LockContainer#getLock(k)
+        let locks = LockContainer#pendingLocks(k)
+        for lock ∈ locks do
+            inspect_transaction(owner, lock)
 ```
 
-The `keys` collection contains a subset of the transaction's affected keys owned by the specific node.
+The figure below shows a scenario where multiple transactions lock the same set of keys.
+In this example, $`Tx_1=Tx_2=Tx_3=\{K1, K2, K3\}`$ and $`Tx_1 < Tx_2 < Tx_3`$.
+Since none of the nodes acquire the remote locks, they enter into a deadlock state.
+From each node's perspective, there are two cycles, for example, $`Tx_1\rightarrow Tx_2 \rightarrow Tx_1`$ and $`Tx_1 \rightarrow Tx_3 \rightarrow Tx_1`$.
+Therefore, to commit a transaction, the algorithm must abort two transactions.
+The `L` is an `LockControlCommand`, `P` is the `Probe`, and `LR` is the `RollbackCommand`.
 
-Upon receiving the probe command, each process traverses the complete list of keys and identifies the ones currently locked, utilizing the `LockManager`.
-If no key is locked, the process can safely ignore the probe.
-Otherwise, the process will acquire the `InfinispanLock` instance for each key.
-For each lock, acquire the owner with `InfinispanLock#acquireOwner` to retrieve who's holding the key.
-Only instances of `GlobalTransaction` objects are valid at this point.
-
-At this stage, the process has transformed the initial `keys` into a collection of `GlobalTransaction` objects.
-From the `GlobalTransaction`, the process needs to acquire information about the complete transaction.
-That is, the node retrieves information about the affected keys to continue probing the processes it is currently depending on.
-
-With the information on affected keys, the process can identify the primary owners of the transaction and relay the probe message.
-
-```json
-{
-    "originator": "initiator-id",
-    "tx": "initiator-tx-id",
-    "keys": ["k1.1", "k2.1", "k3.1", ...]
-}
-```
-
-This execution continues until there is a cycle or the initiator receives an empty response for all the initial probe commands.
-In the latter case, the system is deadlock-free, and the timeout failed for another reason.
-The probe does not happen on a snapshot.
-The system might change while the probe mechanism runs.
-But as long as the system is stuck, the deadlock is present.
-
-In the former case, there is a deadlock in the system, and the process can act to solve it.
-The easiest way to solve it is for the originator process to roll back the transaction associated with the transaction identifier relayed in all messages.
-This way, the client can safely retry the transaction, and any other dependent transaction will be free to continue.
-
-This approach of rolling back the transaction could lead to an undesired effect known as *over-killing*.
-This effect could occur when different processes in the cycle start the algorithm simultaneously.
-Multiple transactions could end up rolled back, whereas only one would be enough to break the chain.
+<img src="./figures/deadlock.svg" />
 
 ## Conclusion
 
-The instance of the deadlock algorithm belongs to a transaction context.
-This approach would allow multiple instances to run in parallel cluster-wide.
-The `dependents` mapping should help avoid duplicate invocations of the probe.
+The algorithm should execute concurrently alongside the usual mechanism of transactions.
+Ideally, if enabled, the overhead on running transactions should be minimal.
+The transactions do not depend on the algorithm's information to complete.
+The overhead happens because of the additional messages exchanged.
 
-This implementation can live outside of the transaction/locking mechanism.
-This approach facilitates testing, where we can test the algorithm directly and triggered by transaction/locking.
-Additionally, it would allow us to make the behavior optional through a property.
+If a transaction deadlocks, the algorithm should identify the cycle sooner than waiting for timeouts, and it should limit the impact by only rolling back as few transactions as needed to proceed.
+Otherwise, without the algorithm running, all the transactions in the cycle would hang until the timeout elapses.
 
-### Open Questions
+### Open Questions 
 
-> How do we react when there is no deadlock in the system after probing?
-> > Should the transaction automatically retry?
-
-> Should we only consider a transaction if the locks are in the `WAITING` state?
-> > If the transaction does not have locks in the `WAITING` state means the locks are successfully acquired and they are not waiting for some external resource.
-
-> The `Probe` command should consider the topology ID. How do we handle topology changes?
-> > Should cause a retry on the probe?
-
-> Is there a difference between utilizing pessimistic/optimistic transactions in this regard?
-> > Should the mechanism work only for pessimistic?
+The `Probe` command should consider the topology ID. Do we retry due to topology changes? What happens to the locks during the topology changes? Depending on how they behave, the algorithm would restart by design. 
 
 ## References
 
 [1] Özsu, T. M., & Valduriez, P. (2011). Principles of Distributed Database Systems.
 
 [2] Chandy, K. M., Misra, J., & Haas, L. M. (1983). Distributed deadlock detection. ACM Transactions on Computer Systems (TOCS), 1(2), 144-156.
+
+[3] Roesler, Marina, and Walter A. Burkhard. "Resolution of deadlocks in object-oriented distributed systems." IEEE Transactions on Computers 38.8 (1989): 1212-1224.
